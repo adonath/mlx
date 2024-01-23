@@ -1,10 +1,13 @@
 # Copyright © 2023 Apple Inc.
 
 import math
+from functools import lru_cache
 from typing import Optional
 
 import mlx.core as mx
 from mlx.nn.layers.base import Module
+
+CACHE_SIZE = 1
 
 
 class RoPE(Module):
@@ -26,13 +29,7 @@ class RoPE(Module):
             each dimension in the positional encodings. Default: ``10000``.
         scale (float, optional): The scale used to scale the positions. Default: ``1.0``.
 
-    Attributes:
-        _cos_sin_theta_key (tuple): Cached key for the precomputed cosine and sine values.
-        _cos_sin_theta_value (tuple): Cached cosine and sine values.
     """
-
-    _cos_sin_theta_key = None
-    _cos_sin_theta_value = None
 
     def __init__(
         self,
@@ -46,6 +43,9 @@ class RoPE(Module):
         self.traditional = traditional
         self.base = base
         self.scale = scale
+        self._rope = (
+            self._compute_traditional_rope if traditional else self._compute_rope
+        )
 
     def _extra_repr(self):
         return f"{self.dims}, traditional={self.traditional}"
@@ -78,24 +78,9 @@ class RoPE(Module):
 
         return rx
 
-    def __call__(self, x, offset: int = 0):
-        shape = x.shape
-        x = mx.reshape(x, (-1, shape[-2], shape[-1]))
-        N = x.shape[1] + offset
-        costheta, sintheta = RoPE.create_cos_sin_theta(
-            N, self.dims, offset=offset, base=self.base, scale=self.scale, dtype=x.dtype
-        )
-
-        rope = (
-            self._compute_traditional_rope if self.traditional else self._compute_rope
-        )
-        rx = rope(costheta, sintheta, x)
-
-        return mx.reshape(rx, shape)
-
-    @classmethod
+    @staticmethod
+    @lru_cache(maxsize=CACHE_SIZE)
     def create_cos_sin_theta(
-        cls,
         N: int,
         D: int,
         offset: int = 0,
@@ -103,14 +88,23 @@ class RoPE(Module):
         scale: float = 1.0,
         dtype=mx.float32,
     ):
-        if (N, D, offset, base, scale, dtype) != cls._cos_sin_theta_key:
-            D = D // 2
-            positions = mx.arange(offset, N, dtype=dtype) * scale
-            freqs = mx.exp(-mx.arange(0.0, D, dtype=dtype) * (math.log(base) / D))
-            theta = mx.reshape(positions, (-1, 1)) * mx.reshape(freqs, (1, -1))
-            cls._cos_sin_theta_key = (N, D, offset, base, scale, dtype)
-            cls._cos_sin_theta_value = (mx.cos(theta), mx.sin(theta))
-        return cls._cos_sin_theta_value
+        D = D // 2
+        positions = mx.arange(offset, N, dtype=dtype) * scale
+        freqs = mx.exp(-mx.arange(0.0, D, dtype=dtype) * (math.log(base) / D))
+        theta = mx.reshape(positions, (-1, 1)) * mx.reshape(freqs, (1, -1))
+        return (mx.cos(theta), mx.sin(theta))
+
+    def __call__(self, x, offset: int = 0):
+        shape = x.shape
+        x = mx.reshape(x, (-1, shape[-2], shape[-1]))
+        N = x.shape[1] + offset
+
+        costheta, sintheta = self.create_cos_sin_theta(
+            N, self.dims, offset=offset, base=self.base, scale=self.scale, dtype=x.dtype
+        )
+
+        rx = self._rope(costheta, sintheta, x)
+        return mx.reshape(rx, shape)
 
 
 class SinusoidalPositionalEncoding(Module):
@@ -174,42 +168,7 @@ class SinusoidalPositionalEncoding(Module):
 
 
 class ALiBi(Module):
-    _alibi_mask_key = None
-    _alibi_mask = None
-
-    @classmethod
-    def create_alibi_matrix(
-        cls,
-        q_sequence_length: int,
-        k_sequence_length: int,
-        num_heads: int,
-        offset: int,
-        dtype=mx.float32,
-    ):
-        if (
-            q_sequence_length,
-            k_sequence_length,
-            num_heads,
-            offset,
-            dtype,
-        ) != cls._alibi_mask_key:
-            x1 = mx.arange(offset, q_sequence_length)
-            x2 = mx.arange(0, k_sequence_length)
-            distance_matrix = -mx.abs(
-                mx.expand_dims(x1[:, None] - x2[None, :], axis=(0, 1))
-            )
-            alibi_slope = ALiBi.create_alibi_slope(num_heads=num_heads)
-            alibi_mask = (distance_matrix * alibi_slope).astype(dtype)
-            cls._alibi_mask_key = (
-                q_sequence_length,
-                k_sequence_length,
-                num_heads,
-                offset,
-                dtype,
-            )
-            cls._alibi_mask = alibi_mask
-
-        return cls._alibi_mask
+    """Implements the ALiBi attention mask."""
 
     @staticmethod
     def create_alibi_slope(num_heads):
@@ -217,14 +176,33 @@ class ALiBi(Module):
         out = mx.power(x, -mx.arange(1, num_heads + 1))
         return mx.expand_dims(out, axis=(-1, -2))
 
+    @staticmethod
+    @lru_cache(maxsize=CACHE_SIZE)
+    def create_alibi_matrix(
+        q_sequence_length: int,
+        k_sequence_length: int,
+        num_heads: int,
+        offset: int,
+        dtype=mx.float32,
+    ):
+        x1 = mx.arange(offset, q_sequence_length)
+        x2 = mx.arange(0, k_sequence_length)
+        distance_matrix = -mx.abs(
+            mx.expand_dims(x1[:, None] - x2[None, :], axis=(0, 1))
+        )
+        alibi_slope = ALiBi.create_alibi_slope(num_heads=num_heads)
+        return (distance_matrix * alibi_slope).astype(dtype)
+
     def __call__(self, attention_scores, offset=0, mask=None):
-        alibi_mask = ALiBi.create_alibi_matrix(
+        alibi_mask = self.create_alibi_matrix(
             q_sequence_length=attention_scores.shape[-2] + offset,
             k_sequence_length=attention_scores.shape[-1],
             num_heads=attention_scores.shape[1],
             offset=offset,
             dtype=attention_scores.dtype,
         )
+
         if mask is not None:
             alibi_mask = alibi_mask + mask
+
         return attention_scores + alibi_mask
